@@ -1,5 +1,6 @@
-//#define DEBUG
+#define DEBUG
 #define LEARN
+#define TIMEROVERFLOW
 
 #ifdef LEARN
 #include <EEPROM.h>
@@ -12,7 +13,6 @@ const int switch2 = 3;       // "prolong" switch
 const int atxRelay = 4;      // main relay
 const int lampRelay = 7;     // standby light relay
 
-//const unsigned long afterSwitchDelay = 100;  // a delay to avoid noise
 #ifdef LEARN
 const unsigned long learnMode = 10;  // how long to wait before entering learn
 #endif
@@ -29,12 +29,14 @@ int state = 0; // 0 - off by main button, 1 - on until timer counts down, 2 - of
 // 3 - entering learn mode before 10 sec, 4 - entering learn mode, 10 sec ok, waiting to release button,
 // 5 - learning, counting time
 unsigned long dateLightSwitch; // variable, millis when it is okay to turn off the light
+#ifdef TIMEROVERFLOW
+extern volatile unsigned long timer0_millis;
+#endif
 
 void setup() {
 #ifdef DEBUG
   Serial.begin(9600);
 #endif
-
 
 #ifdef LEARN
   // EEPROM stores minutes to wait.
@@ -50,7 +52,10 @@ void setup() {
   Serial.print(", final light delay is "); Serial.println(lightDelay);
 #endif // debug
 #else // if no learn
-  lightDelay = 30 * 60; //tmp*60;
+  lightDelay = 30 * 60;
+#ifdef DEBUG
+  Serial.print("light delay is "); Serial.println(lightDelay);
+#endif // debug
 #endif // learn
 
   // initialize the relays as outputs:
@@ -62,6 +67,12 @@ void setup() {
   pinMode(switch2, INPUT);
 
   setRelays();
+
+#ifdef TIMEROVERFLOW
+  noInterrupts ();
+  timer0_millis = -10000;
+  interrupts ();
+#endif
 }
 
 void loop() {
@@ -73,10 +84,10 @@ void loop() {
     // 1. goto state 1: it was off, now they turned it on by main button.
     // start the timer, turn on the light
     state = 1; light = 1;
-    tmp = millis();
-    dateLightSwitch = tmp + lightDelay * 1000;
+    dateLightSwitch = millis();
+
 #ifdef DEBUG
-    Serial.print("s0>1 now is "); Serial.print(millis()); Serial.print(" will turn off at "); Serial.println(dateLightSwitch);
+    Serial.print("s0>1 now is "); Serial.print(millis()); Serial.print(" will turn off in "); Serial.print(lightDelay); Serial.println(" seconds");
 #endif
     setRelays();
   }
@@ -91,15 +102,17 @@ void loop() {
     setRelays();
   }
 
-  tmp = millis();
-  if ((HIGH == btn1) && (1 == state) && (tmp > dateLightSwitch)) {
-    // 3. it was on, timer count down, but the button is still on.
-    // goto state 2, turn off the light.
-    state = 2; light = 0;
+  if ((HIGH == btn1) && (1 == state)) {
+    tmp = millis();
+    if (tmp - dateLightSwitch > lightDelay * 1000) {
+      // 3. it was on, timer went down, but the button is still on.
+      // goto state 2, turn off the light.
+      state = 2; light = 0;
 #ifdef DEBUG
-    Serial.print("s0>2 now is "); Serial.println(millis());
+      Serial.print("s0>2 now is "); Serial.println(tmp);
 #endif
-    setRelays();
+      setRelays();
+    }
   }
 
   if ((LOW == btn1) && (2 == state)) {
@@ -115,10 +128,9 @@ void loop() {
   if ((HIGH == btn2) && (1 == state)) {
     // 5. the light is on, but they pushed the prolong button. rewind the timer, save the state
     state = 1; light = 1;
-    tmp = millis();
-    dateLightSwitch = tmp + lightDelay * 1000;
+    dateLightSwitch = millis();
 #ifdef DEBUG
-    Serial.print("s1>1 prolong "); Serial.print(millis()); Serial.print(" will turn off at "); Serial.println(dateLightSwitch);
+    Serial.print("s1>1 prolong "); Serial.print(millis()); Serial.print(" will turn off in "); Serial.print(lightDelay); Serial.println(" seconds");
 #endif
     //    setRelays();  // no need to click, cause the light is already on
   }
@@ -127,10 +139,9 @@ void loop() {
     // 6. the timer went out, the light is off, but they pushed the prolong button.
     // rewind the timer, set the light back on.
     state = 1; light = 1;
-    tmp = millis();
-    dateLightSwitch = tmp + lightDelay * 1000;
+    dateLightSwitch = millis();
 #ifdef DEBUG
-    Serial.print("s2>1 prolong "); Serial.print(millis()); Serial.print(" will turn off at "); Serial.println(dateLightSwitch);
+    Serial.print("s2>1 prolong "); Serial.print(millis()); Serial.print(" will turn off in "); Serial.print(lightDelay); Serial.println(" seconds");
 #endif
     setRelays();
   }
@@ -139,11 +150,10 @@ void loop() {
   if ((LOW == btn1) && (0 == state) && (HIGH == btn2)) {
     // 7. Learning mode. The light was off and the main button is off, but they pushed the prolong button.
     // we will count 10 seconds to enter learn mode
-    tmp = millis();
-    dateLightSwitch = tmp + learnMode * 1000;
+    dateLightSwitch = millis();
     state = 3; light = 0;
 #ifdef DEBUG
-    Serial.print("entering learn, now is "); Serial.print(tmp); Serial.print(" will enter at "); Serial.println(dateLightSwitch);
+    Serial.print("entering learn, now is "); Serial.print(tmp); Serial.print(" will enter in "); Serial.print(learnMode); Serial.println(" seconds");
 #endif
   }
 
@@ -152,22 +162,24 @@ void loop() {
     // no learning today. goto state 0.
     state = 0; light = 0;
 #ifdef DEBUG
-        Serial.println("exit learn");
+    Serial.println("exit learn");
 #endif
   }
 
-  tmp = millis();
-  if ((LOW == btn1) && (3 == state) && (HIGH == btn2) && (tmp > dateLightSwitch)) {
-    // 9. We were entering learn mode, 10 seconds with pressed prolong button passed, fine!
-    // we are in the learning mode now. Switch the small relay, going to state 4 where we wait for prolong key to release.
+  if ((LOW == btn1) && (3 == state) && (HIGH == btn2)) {
+    tmp = millis();
+    if (tmp - dateLightSwitch > learnMode*1000) {
+      // 9. We were entering learn mode, 10 seconds with pressed prolong button passed, fine!
+      // we are in the learning mode now. Switch the small relay, going to state 4 where we wait for prolong key to release.
 #ifdef DEBUG
-    Serial.print("entered learn, state 4,now is "); Serial.print(tmp); Serial.print(" entered by "); Serial.println(dateLightSwitch);
+      Serial.print("entered learn, state 4, now is "); Serial.print(tmp); Serial.print(" entered by "); Serial.println(dateLightSwitch);
 #endif
 
-    digitalWrite(lampRelay, !digitalRead(lampRelay));
-    delay(1000);
-    digitalWrite(lampRelay, !digitalRead(lampRelay));
-    state = 4; light = 0;
+      digitalWrite(lampRelay, !digitalRead(lampRelay));
+      delay(1000);
+      digitalWrite(lampRelay, !digitalRead(lampRelay));
+      state = 4; light = 0;
+    }
   }
 
   if ((LOW == btn1) && (4 == state) && (LOW == btn2)) {
@@ -177,7 +189,7 @@ void loop() {
     tmp = millis();
     dateLightSwitch = tmp;
 #ifdef DEBUG
-    Serial.println("both buttons down, goto state 5");
+    Serial.println("both buttons down, start learn, goto state 5");
 #endif
   }
 
@@ -209,7 +221,7 @@ void loop() {
   if ((HIGH == btn1) && (5 == state || 4 == state || 3 == state)) {
     // 11. If they pushed the main button while in learning mode, that means it was a mistake
     // no learning today. Break the learn, no modifications done, forget everything.
-    // We will swutcg from 0 state to 1 on next cycle.
+    // We will switch from 0 state to 1 on next cycle.
 
     state = 0; light = 0;
     setRelays();
@@ -221,9 +233,9 @@ void loop() {
 }
 
 void setRelays() {
-  digitalWrite(atxRelay, (0 == light) ? HIGH : LOW);
-  digitalWrite(lampRelay, (0 == light) ? LOW : HIGH);
-  //  delay(afterSwitchDelay);
+  // my relays are ON when the pin is LOW and OFF when HIGH
+  digitalWrite(atxRelay, (0 == light) ? LOW : HIGH);
+  digitalWrite(lampRelay, (0 == light) ? HIGH : LOW);
 #ifdef DEBUG
   Serial.print("state is "); Serial.print(state); Serial.print("; light is "); Serial.println(light);
 #endif
